@@ -503,9 +503,88 @@ E2E 테스트 결과 (processing_id: 85b6bed1, skip_llm=true):
 ✅ FastAPI Swagger UI - http://localhost:9002/docs
 ✅ 환각 필터 (5단계)
 ✅ 인접 짧은 세그먼트 병합
-⬜ 운율 1차 + LLM 포함 E2E (skip_llm=false, 새 인라인 태그)
+✅ 감정 전용 LLM E2E (llm_mode=emotion, 실험 10)
+⬜ llm_mode=report 보고서 E2E (추후)
 ⬜ STT 품질 (환각·공백·장세그먼트) — 최우선 과제
 ⬜ 위험 키워드 맥락 필터 (오탐: 돌아가/죽었/아파)
 ⬜ 운율 2차: 긴 세그먼트 분할, STT 기반 말속도
 ⬜ Docker/Celery 통합
 ⬜ 프롬프트 규칙 700~800줄 추가 (추후)
+
+
+[2026-06-04] GitHub 백업 + feature/emotion-only-llm 브랜치
+────────────────────────────────────────
+- 저장소: https://github.com/geonhui-bit/voice_analysis-api
+- main, feature/emotion-only-llm 브랜치 push 완료
+- .gitignore: .env, venv/, 테스트 JSON, pretrained_models 등 제외
+
+
+[실험 10] 감정·화자 전용 LLM 분리 (emotion-only-llm 브랜치)
+────────────────────────────────────────
+
+목표:
+- 보고서(건강·식사·약 요약)는 당장 사용 안 함
+- 텍스트 + 세그먼트 운율 → LLM 감정·화자 분석만 JSON으로 출력
+- 나중에 report_prompt.txt 를 별도로 두어 2프롬프트 구조로 확장
+
+배경:
+- skip_llm=true 이면 감정 분석도 함께 사라지는 문제
+- ML 감정 모델은 실험 7에서 비활성 유지 (방법 D)
+
+코드 변경:
+1. app/prompts/emotion_prompt.txt (신규)
+   - 화자별_분석, 감정_변화_포인트, 대화_전체_분위기 JSON
+   - 보고서 필드(건강·식사·약) 제외
+
+2. app/services/transcript_builder.py (신규)
+   - build_analysis_meta(), build_prosody_transcript()
+   - serialize_segment_prosody() — API 응답용
+
+3. app/services/llm_summarizer.py
+   - analyze_emotion_speakers() 추가 (LLM_EMOTION_MAX_TOKENS=2048)
+   - summarize_transcript() = report 모드 전용 유지
+
+4. app/main.py
+   - skip_llm 제거 → llm_mode: none | emotion(기본) | report
+   - 응답 필드 추가:
+     * emotion_analysis (LLM 감정 결과)
+     * segment_prosody, prosody_transcript
+   - emotion_data = {} (ML, 미사용)
+
+API 사용:
+- llm_mode=none     → STT+운율+가드레일만
+- llm_mode=emotion  → + LLM 감정·화자 분석 (기본)
+- llm_mode=report   → + 방문 보고서 (기존 report_prompt)
+
+E2E 테스트 (processing_id: 03c8469a, llm_mode=emotion):
+- 테스트 음성: uploads/2502340c_...wav (~9.6분)
+- 처리 시간:
+  * STT+화자분리: 116.86초
+  * 운율분석: 7.33초
+  * LLM 감정분석: 104.32초
+  * 총: 228.52초
+- summary: null (보고서 없음) ✅
+- emotion_analysis: 정상 JSON 반환 ✅
+
+감정 판단 결과 (보고서 대비 개선 유지):
+  * 매니저: "걱정 및 염려", 친근하고 세심하게 챙기는 톤
+  * 시니어: "담담함", 수동적이고 차분한 톤
+  * 동거인: "중립 및 약간의 불만"
+  * 대화_전체_분위기: 편안하고 친근, 약 복용·가사 관련 잔소리
+
+감정_변화_포인트 3건 (운율 급변+텍스트 근거):
+  * 01:27~01:39 매니저 걱정 (피치+23%)
+  * 03:15~03:26 시니어 기력 저하 (피치-30%)
+  * 03:47~03:53 동거인 불만 (피치+47%)
+
+응답 필드 확인:
+  * prosody_transcript: |운율:| 인라인 포함 ✅
+  * segment_prosody: 세그먼트별 운율 JSON ✅
+  * emotion_data: {} (ML 미사용) ✅
+
+잔존 이슈:
+  * STT 환각: "및 해 주신 모든", "자막 제공", 03:53~05:40 공백
+  * speaker_roles: UNKNOWN→시니어 매핑 (키워드 규칙 한계)
+  * danger_detection: 운율 급변 다발 플래그만 (키워드 오탐 없음)
+
+결과 파일: emotion_test_result.json (로컬, gitignore)

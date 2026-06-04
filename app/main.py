@@ -9,6 +9,7 @@ import shutil
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,15 +24,27 @@ from app.services.guard_filter import (
     detect_dangers_from_audio,
     build_enriched_transcript,
 )
-from app.services.llm_summarizer import summarize_transcript, check_danger_detected
+from app.services.transcript_builder import (
+    build_analysis_meta,
+    build_prosody_transcript,
+    serialize_segment_prosody,
+)
+from app.services.llm_summarizer import (
+    analyze_emotion_speakers,
+    summarize_transcript,
+    check_danger_detected,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="음성 분석 파이프라인 API",
-    description="음성 파일 → STT → 화자분리 → 운율분석 → 가드레일 → LLM 보고서 (감정은 LLM이 텍스트+운율로 판단)",
-    version="0.1.0",
+    description=(
+        "음성 → STT → 화자분리 → 운율 → 가드레일 → LLM. "
+        "llm_mode: none(운율만) | emotion(감정·화자) | report(방문보고서)"
+    ),
+    version="0.2.0",
 )
 
 UPLOAD_DIR = Path("uploads")
@@ -54,13 +67,13 @@ async def analyze_audio(
     age: str = Form("", description="시니어 나이"),
     gender: str = Form("", description="시니어 성별"),
     address: str = Form("", description="시니어 주소"),
-    skip_llm: bool = Form(False, description="True면 LLM 보고서 생성 건너뜀"),
+    llm_mode: Literal["none", "emotion", "report"] = Form(
+        "emotion",
+        description="none=LLM없음, emotion=감정·화자분석(기본), report=방문보고서",
+    ),
 ):
     """
-    음성 파일을 업로드하면 전체 파이프라인을 실행합니다.
-
-    1. STT (Whisper) → 2. 화자분리 (pyannote) → 3. 운율분석 (torchcrepe)
-    → 4. 가드레일 → 5. LLM 보고서 (감정은 LLM이 텍스트+운율로 직접 판단)
+    1. STT + 화자분리 → 2. 운율 → 3. 가드레일 → 4. LLM (mode에 따라)
     """
     processing_id = str(uuid.uuid4())[:8]
     start_time = time.perf_counter()
@@ -69,112 +82,100 @@ async def analyze_audio(
     with open(save_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    logger.info(f"[{processing_id}] 파일 저장: {save_path}")
+    logger.info(f"[{processing_id}] 파일 저장: {save_path}, llm_mode={llm_mode}")
 
     try:
         audio_path = str(save_path)
         timing = {}
 
-        # 1~2. STT + 화자분리
         t0 = time.perf_counter()
         stt_result = transcribe_with_diarization(audio_path)
         timing["stt_diarization"] = round(time.perf_counter() - t0, 2)
 
         segments = stt_result["segments"]
-        logger.info(f"[{processing_id}] STT+화자분리 완료: {len(segments)}개 세그먼트 ({timing['stt_diarization']}초)")
+        logger.info(
+            f"[{processing_id}] STT+화자분리 완료: {len(segments)}개 ({timing['stt_diarization']}초)"
+        )
 
-        # 3. 감정분석 (비활성화 - LLM이 텍스트+운율로 직접 판단)
         emotion_data = {}
-        logger.info(f"[{processing_id}] 감정분석 스킵 (LLM 기반 감정 판단 사용)")
 
-        # 4. 운율분석 (baseline + 상대값 + 급변, 1회 pass)
         t0 = time.perf_counter()
         segment_prosody, prosody_data = analyze_prosody_full(audio_path, segments)
         timing["prosody"] = round(time.perf_counter() - t0, 2)
         logger.info(f"[{processing_id}] 운율분석 완료 ({timing['prosody']}초)")
 
-        # 5. 가드레일
         speaker_roles = identify_speaker_roles(segments, emotion_data, prosody_data)
         danger_detection = detect_dangers_from_audio(segments, emotion_data, prosody_data)
         enriched_transcript = build_enriched_transcript(segments, speaker_roles)
 
-        # 6. LLM 보고서
+        duration_sec = int(segments[-1].get("end", 0)) if segments else 0
+        analysis_meta = build_analysis_meta(speaker_roles, prosody_data, danger_detection)
+        prosody_transcript = build_prosody_transcript(
+            segments, segment_prosody, speaker_roles, format_prosody_inline_tag
+        )
+
+        emotion_analysis = None
         summary = None
-        if not skip_llm:
+
+        if llm_mode in ("emotion", "report"):
             t0 = time.perf_counter()
-
-            now = datetime.now()
-            duration_sec = int(segments[-1].get("end", 0)) if segments else 0
-            start_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
-            end_time_str = (now + timedelta(seconds=duration_sec)).strftime("%Y-%m-%d %H:%M:%S")
-
-            # 화자별 종합 운율 (참고용)
-            analysis_meta_lines = ["[화자별 운율 종합 (baseline 기준)]"]
-            for speaker, role in speaker_roles.items():
-                pros = prosody_data.get(speaker, {})
-                voice_desc = pros.get("voice_description", "분석 불가")
-                bp = pros.get("baseline_pitch", 0)
-                analysis_meta_lines.append(
-                    f"- {role}({speaker}): baseline {bp:.0f}Hz, {voice_desc}"
-                )
-            if danger_detection.get("detected"):
-                analysis_meta_lines.append(f"- 위험 플래그: {', '.join(danger_detection['flags'])}")
-            analysis_meta = "\n".join(analysis_meta_lines)
-
-            # 세그먼트별 운율 인라인 트랜스크립트 생성
-            prosody_transcript_lines = []
-            for i, seg in enumerate(segments):
-                start = seg.get("start", 0)
-                end = seg.get("end", 0)
-                speaker = seg.get("speaker", "UNKNOWN")
-                text = seg.get("text", "").strip()
-                role = speaker_roles.get(speaker, speaker)
-
-                start_str = f"{int(start//60):02d}:{start%60:05.1f}"
-                end_str = f"{int(end//60):02d}:{end%60:05.1f}"
-
-                sp = segment_prosody[i] if i < len(segment_prosody) else None
-                if sp and sp.get("prosody"):
-                    pros_tag = format_prosody_inline_tag(sp["prosody"])
-                    prosody_transcript_lines.append(
-                        f"[{start_str}~{end_str}] [{role}] {text}  |운율: {pros_tag}|"
-                    )
-                else:
-                    prosody_transcript_lines.append(
-                        f"[{start_str}~{end_str}] [{role}] {text}"
-                    )
-            prosody_transcript = "\n".join(prosody_transcript_lines)
-
-            summary = summarize_transcript(
-                transcript=prosody_transcript,
-                start_time=start_time_str,
-                end_time=end_time_str,
-                duration_sec=duration_sec,
-                admin_name=admin_name,
-                admin_phone=admin_phone,
-                patient_name=patient_name,
-                age=age,
-                gender=gender,
-                address=address,
-                analysis_meta=analysis_meta,
-                danger_info=danger_detection if check_danger_detected(danger_detection) else None,
+            danger_for_llm = (
+                danger_detection if check_danger_detected(danger_detection) else None
             )
-            timing["llm"] = round(time.perf_counter() - t0, 2)
-            logger.info(f"[{processing_id}] LLM 보고서 완료 ({timing['llm']}초)")
 
-        total_time = round(time.perf_counter() - start_time, 2)
-        timing["total"] = total_time
+            if llm_mode == "emotion":
+                emotion_analysis = analyze_emotion_speakers(
+                    transcript=prosody_transcript,
+                    analysis_meta=analysis_meta,
+                    duration_sec=duration_sec,
+                    danger_info=danger_for_llm,
+                )
+                timing["llm_emotion"] = round(time.perf_counter() - t0, 2)
+                logger.info(
+                    f"[{processing_id}] LLM 감정분석 완료 ({timing['llm_emotion']}초)"
+                )
+
+            if llm_mode == "report":
+                now = datetime.now()
+                start_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+                end_time_str = (now + timedelta(seconds=duration_sec)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                summary = summarize_transcript(
+                    transcript=prosody_transcript,
+                    start_time=start_time_str,
+                    end_time=end_time_str,
+                    duration_sec=duration_sec,
+                    admin_name=admin_name,
+                    admin_phone=admin_phone,
+                    patient_name=patient_name,
+                    age=age,
+                    gender=gender,
+                    address=address,
+                    analysis_meta=analysis_meta,
+                    danger_info=danger_for_llm,
+                )
+                timing["llm_report"] = round(time.perf_counter() - t0, 2)
+                logger.info(
+                    f"[{processing_id}] LLM 보고서 완료 ({timing['llm_report']}초)"
+                )
+
+        timing["total"] = round(time.perf_counter() - start_time, 2)
 
         return {
             "processing_id": processing_id,
             "success": True,
+            "llm_mode": llm_mode,
             "transcript_plain": stt_result["transcript_plain"],
             "transcript_labeled": stt_result["transcript_labeled"],
             "transcript_enriched": enriched_transcript,
+            "prosody_transcript": prosody_transcript,
             "speaker_roles": speaker_roles,
             "emotion_data": emotion_data,
             "prosody_data": prosody_data,
+            "segment_prosody": serialize_segment_prosody(segment_prosody),
             "danger_detection": danger_detection,
+            "emotion_analysis": emotion_analysis,
             "summary": summary,
             "timing": timing,
         }
@@ -183,7 +184,7 @@ async def analyze_audio(
         logger.error(f"[{processing_id}] 파이프라인 실패: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
-            content={"processing_id": processing_id, "success": False, "error": str(e)}
+            content={"processing_id": processing_id, "success": False, "error": str(e)},
         )
 
     finally:
