@@ -1,0 +1,54 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Seoul
+
+WORKDIR /app
+
+# 시스템 패키지
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends --fix-missing \
+    python3 python3-pip ffmpeg libsndfile1 git curl build-essential ca-certificates && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
+
+# cuDNN
+COPY cudnn-local-repo-ubuntu2204-9.13.0_1.0-1_amd64.deb ./
+RUN dpkg -i cudnn-local-repo-ubuntu2204-9.13.0_1.0-1_amd64.deb && \
+    cp /var/cudnn-local-repo-ubuntu2204-9.13.0/cudnn-*-keyring.gpg /usr/share/keyrings/ && \
+    apt-get update && \
+    apt-get install -y cudnn9-cuda-12 && \
+    rm cudnn-local-repo-ubuntu2204-9.13.0_1.0-1_amd64.deb
+
+RUN python3 -m pip install --upgrade pip
+
+# 1단계: PyTorch
+COPY requirements/celery-torch.txt ./requirements-torch.txt
+RUN pip install --no-cache-dir -r requirements-torch.txt
+
+# 2단계: pyannote (WhisperX 화자분리에 필요)
+COPY requirements/celery-pyannote.txt ./requirements-pyannote.txt
+RUN pip install --no-cache-dir -r requirements-pyannote.txt
+
+# 3단계: WhisperX + SpeechBrain + CREPE
+COPY requirements/celery-whisperx.txt ./requirements-whisperx.txt
+RUN pip install --no-cache-dir -r requirements-whisperx.txt
+
+# 4단계: 나머지
+COPY requirements/celery.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 앱 코드 복사
+COPY app/ ./app/
+
+# GCS 인증
+RUN mkdir -p /app/credentials/
+COPY credentials/onebutton-care-86355e6c5b29.json /app/credentials/
+ENV GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/onebutton-care-86355e6c5b29.json
+
+# 환경 변수
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Celery Worker (GPU 1대일 때 concurrency=1 권장 - 모델 VRAM 공유 이슈)
+CMD ["celery", "-A", "app.tasks.celery_config:celery_app", "worker", "--loglevel=info", "--concurrency=1"]

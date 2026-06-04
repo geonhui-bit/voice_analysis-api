@@ -1,0 +1,511 @@
+================================================================================
+음성 분석 파이프라인 실험 기록
+프로젝트: /home/junctionmed/Desktop/test api
+장비: NVIDIA DGX Spark (GB10, Blackwell, SM 12.1, 128GB 통합메모리)
+================================================================================
+
+[2026-05-26] 프로젝트 초기 세팅
+────────────────────────────────────────
+- PDF 문서 기반으로 전체 파이프라인 코드 생성
+- 파일 구조:
+  app/services/whisperx_loader.py  (STT + 화자분리)
+  app/services/emotion_analyzer.py (감정분석)
+  app/services/prosody_analyzer.py (운율분석)
+  app/services/guard_filter.py     (가드레일 필터)
+  app/services/llm_summarizer.py   (LLM 보고서 생성)
+  app/prompts/report_prompt.txt    (프롬프트 템플릿)
+  app/tasks/audio_pipeline_v2.py   (Celery 태스크)
+  app/main.py                      (FastAPI 서버)
+
+- 포트 설정 (.env):
+  API_PORT=9002 (기존 VOICE_LAB 9001과 충돌 방지)
+  REDIS_PORT=6382 (기존 Redis 6381과 충돌 방지)
+
+
+[2026-05-26] GB10 호환성 문제 해결
+────────────────────────────────────────
+문제1: CTranslate2 (faster-whisper) CUDA 미지원
+  - SM 12.1을 CTranslate2가 인식 못함
+  - 해결: WhisperX의 CTranslate2 대신 HuggingFace transformers Whisper 사용
+
+문제2: CREPE (TensorFlow 기반) GB10 비호환
+  - 해결: torchcrepe (PyTorch 기반)로 교체
+
+문제3: pyannote 화자분리 시 nvrtc JIT 컴파일 에러
+  - torchaudio/compliance/kaldi.py에서 .abs() 호출 시 SM 12.1 JIT 실패
+  - 해결: fft.abs() → torch.sqrt(fft.real**2 + fft.imag**2) 로 패치
+
+문제4: DiarizationPipeline 인자명 변경
+  - use_auth_token → token 으로 변경
+
+- test_audio_analysis.py로 GB10에서 전체 파이프라인 테스트 성공
+  (STT → 화자분리 → 감정 → 운율 → 가드레일)
+
+
+[2026-05-26] LLM 서버 세팅
+────────────────────────────────────────
+- 모델: cyankiwi/gemma-4-31B-it-AWQ-4bit (compressed-tensors, ~20GB)
+- 서버: vllm/vllm-openai:gemma4-cu130 Docker 이미지
+- 포트: 2000
+- GPU 점유: 0.37 (128GB 중 ~47GB)
+  → 음성 모델과 동시 사용 가능하도록 조절
+- KV 캐시: 21.18 GiB, 최대 8192 토큰, 동시 7건
+- 테스트 결과: 한국어 응답 정상, ~8.2 tok/s
+
+.env에 추가:
+  LLM_BASE_URL=http://localhost:2000
+  LLM_MODEL=/models/gemma-4-31B-it-AWQ-4bit
+  LLM_MAX_TOKENS=4096
+
+
+[2026-05-27] FastAPI Swagger UI 구축
+────────────────────────────────────────
+- app/main.py 생성 → http://localhost:9002/docs
+- app/services/ 파일들을 GB10 호환 코드로 수정
+  - whisperx_loader.py: transformers Whisper로 교체
+  - prosody_analyzer.py: torchcrepe로 교체
+  - emotion_analyzer.py, guard_filter.py: app.utils 의존성 제거
+- 엔드포인트: POST /analyze (음성 파일 업로드 → 전체 파이프라인)
+
+
+[2026-05-27] 첫 번째 End-to-End 테스트 결과
+────────────────────────────────────────
+파일: audio_converted_d66d...836d.wav (~9분)
+
+결과:
+  - STT + 화자분리: 117.64초 (SPEAKER_00, SPEAKER_01, UNKNOWN 3명 감지)
+  - 감정분석: 5.03초
+  - 운율분석: 4.91초
+  - LLM 보고서: 실패 (파싱 에러)
+  - 총 시간: 127.6초
+
+발견된 문제:
+  1. Whisper 환각: "아 아 아 아..." 수백 번 반복 (00:30~00:37 구간)
+  2. LLM JSON 파싱 실패: Python .format()이 프롬프트 내 {} 를 변수로 해석
+  3. 감정분석 전부 "angry": SpeechBrain 영어 모델이 한국어를 오분류
+  4. 역할 매핑: 매니저/시니어/동거인 자동 분류 정상 동작
+  5. 운율분석: 피치, 에너지, 말속도 정상 출력
+
+
+[2026-05-27] 버그 수정
+────────────────────────────────────────
+수정1: Whisper 환각 필터 (whisperx_loader.py)
+  - 같은 단어 5개 이상 반복 시 세그먼트 제거
+  - 같은 구절 60% 이상 반복 시 제거
+  - 빈 텍스트, end ≤ start 세그먼트 제거
+
+수정2: LLM 파싱 오류 (llm_summarizer.py + report_prompt.txt)
+  - 프롬프트 내 JSON 예시의 {} → {{}} 이스케이프
+  - ```json ``` 코드블록 내 JSON 추출 로직 추가
+  - "JSON만 출력하세요" 지시 추가
+
+수정3: 감정분석 모델 교체 (emotion_analyzer.py)
+  - 이전: SpeechBrain (영어 IEMOCAP, 감정 4개)
+  - 이후: jungjongho/wav2vec2-xlsr-korean-speech-emotion-recognition2_data_rebalance
+    - 한국어 AI-Hub 데이터 학습
+    - 감정 7개 (angry, disgust, fear, happy, neutral, sad, surprise)
+    - Apache 2.0 라이선스 (상업 사용 가능)
+    - 총 다운로드 42,000+회
+    - HuggingFace 보안 스캔 통과 (악성 코드 없음)
+
+
+[2026-05-27] 두 번째 End-to-End 테스트 (processing_id: dbb3e122)
+────────────────────────────────────────
+파일: audio_converted_d66d...836d.wav (~9분), 동일 파일 재사용
+
+결과:
+  - STT + 화자분리: 116.43초
+  - 감정분석: 27.74초 (새 한국어 모델 첫 로딩 포함)
+  - 운율분석: 4.6초
+  - LLM 보고서: 실패 (400 Bad Request)
+  - 총 시간: 148.8초
+
+로그 확인 결과 - 수정사항 반영 여부:
+  ✅ 환각 필터 작동 확인: "아 아 아 아..." 필터링 성공 (로그 22번째 줄)
+  ✅ 한국어 감정 모델 로딩 성공 (로그 55번째 줄)
+  ❌ 감정 모델 classifier 가중치 미초기화 (로그 53번째 줄)
+  ❌ LLM 토큰 초과 (8193 > 8192)
+
+발견된 문제:
+
+  문제1: 감정 모델 classifier 가중치 미초기화
+    로그: "Some weights of Wav2Vec2ForSequenceClassification were not initialized
+           from the model checkpoint and are newly initialized:
+           ['classifier.bias', 'classifier.weight', 'projector.bias', 'projector.weight']"
+    원인: jungjongho 모델의 아키텍처는 "Wav2Vec2ForSpeechClassification" (커스텀 클래스)
+          transformers의 AutoModelForAudioClassification이 이를
+          "Wav2Vec2ForSequenceClassification"으로 로딩 → 레이어 이름 불일치
+          모델 파일 내부: classifier.dense.weight / classifier.out_proj.weight
+          transformers 기대: projector.weight / classifier.weight
+          → classifier가 랜덤 초기화되어 전부 "angry"로 분류
+    ※ 이 문제는 transformers >= 4.51의 알려진 이슈
+       (ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition에서도 동일 보고)
+
+  문제2: LLM 프롬프트 길이 초과
+    로그: "maximum context length is 8192 tokens.
+           you requested 4096 output tokens and your prompt contains at least 4097 tokens"
+    원인: vLLM 컨테이너가 --max-model-len 8192로 시작됨
+          프롬프트(8769자 ≈ 4097토큰) + max_tokens(4096) = 8193 > 8192
+
+  문제3: 세그먼트 간 반복 미처리
+    "술이 안 먹으시네" 4회 연속, "식사하시고 약 드셔야되나?" 6회 연속 등
+    세그먼트 내부 반복은 필터링되었으나, 세그먼트 간 반복은 미처리
+
+
+[2026-05-27] 감정 모델 가중치 문제 조사 및 해결
+────────────────────────────────────────
+조사:
+  - pytorch_model.bin 내부 키 확인 (다운로드 없이 HF Hub API로 검사)
+    classifier.dense.weight: [1024, 1024]
+    classifier.dense.bias: [1024]
+    classifier.out_proj.weight: [6, 1024]
+    classifier.out_proj.bias: [6]
+  - 가중치는 정상적으로 존재 → 이름 매핑만 안 되는 문제
+  - v2 (data_rebalance, 99.8%) 와 v3 (98.76%) 모두 동일한 구조, 동일한 문제
+
+  config.json 확인:
+    architectures: ["Wav2Vec2ForSpeechClassification"] (커스텀 클래스)
+    id2label: {0: "기쁨", 1: "당황", 2: "분노", 3: "불안", 4: "슬픔", 5: "중립"}
+    classifier_proj_size: 256
+    pooling_mode: "mean"
+
+인터넷 조사 결과 (해결 방법 3가지):
+  방법1: 수동 가중치 매핑 (커스텀 클래스로 원본 구조 재현 후 가중치 직접 복사)
+  방법2: 모델 교체 (Dpngtm/wav2vec2-emotion-recognition 등 호환 모델)
+  방법3: SenseVoice (알리바바, 한국어 지원) → 중국 모델이므로 제외
+
+해결: 방법1 (수동 가중치 매핑) 채택
+  - Wav2Vec2EmotionClassifier 커스텀 클래스 정의
+  - 원본 학습 구조 재현: Wav2Vec2Model → mean pooling → Linear(1024→1024) → tanh → Linear(1024→6)
+  - huggingface_hub.hf_hub_download로 pytorch_model.bin 로드
+  - sd["classifier.dense.weight"] → self.dense.weight.data.copy_()
+  - sd["classifier.out_proj.weight"] → self.out_proj.weight.data.copy_()
+  - 모델: jungjongho/wav2vec2-xlsr-korean-speech-emotion-recognition2_data_rebalance (99.8%)
+  - 감정 라벨: 기쁨, 당황, 분노, 불안, 슬픔, 중립 (한국어 6가지)
+
+
+[2026-05-27] LLM 토큰 초과 문제 해결
+────────────────────────────────────────
+  - LLM_MAX_TOKENS: 4096 → 2048 (.env + llm_summarizer.py)
+  - 보고서 출력은 2048토큰(한국어 약 1500~2000자)이면 충분
+  - 프롬프트 12000자 초과 시 대화 내용 자동 축약 안전장치 추가
+  - 근본 해결: 추후 vLLM 컨테이너를 --max-model-len 32768로 재생성 예정
+
+
+[2026-05-27] 세그먼트 간 반복 필터 추가
+────────────────────────────────────────
+  - whisperx_loader.py 화자분리 후, 출력 포맷팅 전에 필터 삽입
+  - 규칙: 연속 3개 이상 동일 텍스트 세그먼트 → 첫 2개 유지, 3번째부터 제거
+  - 로그에 제거 건수 출력
+
+
+[2026-05-27] vLLM 컨테이너 재구성 (max-model-len 확장 + GPU 점유율 조정)
+────────────────────────────────────────
+배경:
+  - 두 번째 E2E 테스트에서 LLM 400 에러 발생 (8193 > 8192 토큰 초과)
+  - LLM_MAX_TOKENS를 2048로 줄이는 임시 조치 대신, vLLM 자체의 컨텍스트 확장이 근본 해결
+
+변경 내역:
+  1. vLLM --max-model-len: 8192 → 32768 (4배 확장)
+  2. vLLM --gpu-memory-utilization: 0.37 → 0.40
+     - 0.37에서는 모델 가중치 + KV 캐시 여유가 빠듯
+     - 0.40으로 올려 캐시 안정성 확보 (128GB 중 ~51GB 사용)
+  3. LLM_MAX_TOKENS: 2048 → 4096 복원 (원래 값)
+  4. MAX_PROMPT_CHARS: 6000 → 50000 복원 (프롬프트 축약 사실상 비활성)
+
+Docker 마운트 경로 수정:
+  - 이전: --model /models/gemma-4-31B-it-AWQ-4bit (존재하지 않는 경로)
+  - 이후: --model /models/models/gemma-4-31B-it-AWQ-4bit
+  - 원인: -v .cache/huggingface:/models 마운트 시 huggingface 내부에
+          models/ 하위폴더가 있어서 컨테이너 내 /models/models/... 가 실제 경로
+  - .env 및 llm_summarizer.py 기본값도 동일하게 수정
+
+vLLM 재시작 결과:
+  docker run -d --name gemma4-31b-vllm \
+    --gpus all \
+    -v /home/junctionmed/.cache/huggingface:/models \
+    -p 2000:8000 \
+    vllm/vllm-openai:gemma4-cu130 \
+    --model /models/models/gemma-4-31B-it-AWQ-4bit \
+    --dtype float16 \
+    --gpu-memory-utilization 0.40 \
+    --max-model-len 32768 \
+    --tensor-parallel-size 1 \
+    --trust-remote-code
+
+  - 모델 로딩: 99.63초 (4개 shard)
+  - KV 캐시: 24.85 GiB, 27,136 토큰
+  - 최대 동시 처리: 32,768 토큰 기준 5.12배
+  - curl http://localhost:2000/v1/models → 정상 응답 확인
+
+
+[2026-05-27] 청크 단위 개선 + 세그먼트 병합 로직 추가
+────────────────────────────────────────
+문제:
+  - transformers Whisper pipeline의 chunk_length_s 미설정으로 짧은 청크 다수 생성
+  - 같은 화자의 1~2초짜리 세그먼트가 병합 없이 개별 출력
+  - 동일/유사 텍스트가 세그먼트 단위로 반복 (정확 일치만 필터링, 유사 텍스트 미감지)
+
+수정 (whisperx_loader.py):
+  1. STT pipeline 청크 설정 추가
+     - chunk_length_s=30 (30초 단위로 오디오 분할)
+     - stride_length_s=(4, 2) (앞 4초, 뒤 2초 겹침 → 경계 문장 보호)
+     - batch_size=8 (여러 청크 병렬 처리)
+
+  2. 같은 화자 인접 세그먼트 병합 (4단계 추가)
+     - 조건: 같은 화자 + (갭 1.5초 이내 or 어느 쪽이든 2초 미만)
+     - 동작: end 타임스탬프 확장, 텍스트 합침 (중복 텍스트는 합치지 않음)
+
+  3. 유사 텍스트 반복 필터 강화 (5단계)
+     - _text_similarity() 함수 추가 (Jaccard 유사도, 단어 집합 기반)
+     - 기존: 정확 일치만 감지
+     - 변경: 유사도 80% 이상이면 반복으로 판정
+     - 3회 이상 연속 시 첫 2개만 유지
+
+
+[2026-05-27] 세 번째 End-to-End 테스트 (processing_id: bee96315)
+────────────────────────────────────────
+파일: audio_converted_d66d...836d.wav (~9분), 동일 파일 재사용
+
+결과:
+  - STT + 화자분리: 119.3초 → 159개 세그먼트
+  - 감정분석: 12.1초
+  - 운율분석: 4.55초
+  - LLM 보고서: 71.1초 → 정상 생성 (917자)
+  - 총 시간: 207.05초
+
+2차 → 3차 비교:
+  ✅ STT 세그먼트: 수백 개(반복 다수) → 159개 (병합+필터 효과)
+  ✅ 세그먼트 병합 로그: 162 → 159 (반복 3개 추가 제거)
+  ✅ 감정분석: 전부 angry → 화자별 분포 차이 존재 (수동 가중치 매핑 적용됨)
+     SPEAKER_00(매니저): 분노 70.9%, 슬픔 24.0%, 불안 3.1%, 당황 2.0%
+     SPEAKER_01(시니어): 분노 45.5%, 슬픔 38.4%, 불안 12.1%, 당황 3.0%
+     UNKNOWN(동거인):    슬픔 75.0%, 분노 25.0%
+  ✅ LLM 보고서: 400 에러 → 정상 생성 (max-model-len 32768 효과)
+     - 대화요약, 시니어_상태(건강/식사/운동/약), 위험요소 등 정상 출력
+     - 화자 역할 매핑: 매니저/시니어/동거인_2 자동 분류
+  ✅ 위험요소 감지: "빈속에 약(관절약) 복용 및 커피 섭취 위험성"
+
+확인 필요:
+  ⚠ 감정분석 중립 비율 0% → 일상 대화에서도 분노/슬픔이 지배적
+    → 모델 학습 데이터 특성일 수 있음, 다른 오디오로 추가 검증 필요
+
+
+[2026-05-28] 네 번째 E2E 테스트 (processing_id: 322d1831)
+────────────────────────────────────────
+파일: audio_converted_d66d...836d.wav (~9분), 동일 파일 재사용
+※ FastAPI 싱글 워커 이슈 발견: 분석 처리 중(~3분) 다른 요청 블로킹됨
+   → 분석 중 /docs 접속 불가, curl 헬스체크도 타임아웃
+
+결과:
+  - STT + 화자분리: 117.01초 → 47개 세그먼트 (3차: 159개 → 대폭 감소)
+  - 감정분석: 12.14초
+  - 운율분석: 7.39초
+  - LLM 보고서: 69.27초 → 정상 생성 (942자)
+  - 총 시간: 205.82초
+
+3차 → 4차 변화:
+  ✅ 세그먼트 수: 159개 → 47개 (병합 효과 큼)
+  ✅ LLM 보고서 정상 (위험요소: "필수 약물 아침 복용 누락" 감지)
+  ✅ 화자 역할 매핑: 매니저/시니어/동거인_2 정상
+
+발견된 문제:
+  1. "공지부공지부..." 수백 회 반복 환각 (05:09~05:40 구간)
+     - 공백 없이 붙어있어 기존 단어 기반 환각 필터 통과
+  2. "한글자막 제공 및 자막 제공 및 협조해 주신 모든 분들께..." YouTube 자막 환각
+     - 01:39, 06:10, 06:54, 09:17 등 여러 곳에서 반복 출현
+     - Whisper가 YouTube 학습 데이터에서 가져온 고정 패턴
+  3. "다음 영상에서 만나요" YouTube 아웃트로 환각 (06:05)
+  4. 타임스탬프-텍스트 불일치
+     - [02:29.500→02:31.500] 2초에 수십 단어
+     - [09:17.040→09:19.480] 2.4초에 수백 단어
+     - 실제 발화량과 맞지 않는 텍스트
+  5. 감정분석 중립 0% → 일상 대화인데 전 화자 "분노"/"슬픔" 지배적
+
+
+[2026-05-28] 환각 필터 강화 + 감정분석 중립 보정
+────────────────────────────────────────
+
+수정1: 문자 단위 반복 감지 (whisperx_loader.py - _is_hallucination)
+  - 공백 제거 후 2~6글자 n-gram 추출
+  - 특정 n-gram이 텍스트 50% 이상 차지하면 환각으로 판정
+  - "공지부공지부..." → "공지부" 3글자가 50% 이상 → 환각 제거
+
+수정2: YouTube 자막 블랙리스트 (whisperx_loader.py - _clean_youtube_hallucination)
+  - 블랙리스트 키워드 8개:
+    "한글자막 제공", "자막 제공 및 협조", "다음 영상에서 만나요",
+    "구독과 좋아요", "진심으로 감사드립니다", "좋아요와 구독",
+    "채널을 구독", "영상이 도움이 되셨다면"
+  - 세그먼트 텍스트에서 해당 문구 제거, 제거 후 빈 세그먼트는 스킵
+
+수정3: 타임스탬프-텍스트량 검증 (whisperx_loader.py - _validate_text_duration)
+  - 한국어 정상 발화: 초당 5~8글자
+  - 초당 15글자 초과 시 → 초당 10글자 기준으로 텍스트 잘라냄
+  - 단어 경계에서 잘라서 어색한 끊김 방지
+
+수정4: 감정분석 중립 보정 (emotion_analyzer.py - analyze_emotion_for_segment)
+  - softmax 최고 확률 < 0.4이면 "중립"으로 재분류
+  - 모델이 확신 없이 분노/슬픔에 분산 확률 줄 때 → 실제로는 뚜렷한 감정 없음
+  - 예: 분노 0.35, 슬픔 0.30, 불안 0.20 → 중립으로 판정
+
+수정5: tone_description 혼합 감정 표현 (emotion_analyzer.py - analyze_emotions_by_speaker)
+  - 1위와 2위 감정 차이 < 10%이면 "혼합 감정" 표현
+  - 예: 분노 45%, 슬픔 40% → "격앙됨, 불만 + 우울함, 침울함 혼합"
+  - 차이 10% 이상이면 기존처럼 1위 감정만 표시
+
+
+[실험 7] 감정분석 아키텍처 변경 - 방법 D 적용 (2026-05-29)
+────────────────────────────────────────
+
+문제:
+- 한국어 감정분석 모델(wav2vec2-xlsr)이 모든 화자를 "분노" 또는 "슬픔"으로 분류
+- softmax < 0.4 중립 보정 적용 후에도 근본적 한계 존재
+- 일반 대화에서도 강한 부정 감정을 높은 확신도로 출력하는 편향
+
+해결 방법 (D: 운율+텍스트 기반 LLM 감정 판단):
+- 독립 감정분석 모델(emotion_analyzer.py) 호출을 비활성화
+- 운율분석(torchcrepe) 결과를 상세 수치로 LLM에 전달
+- LLM이 대화 내용(텍스트) + 운율 데이터(피치/에너지/말속도)를 종합하여 감정 판단
+
+수정 파일:
+1. app/prompts/report_prompt.txt
+   - "음성 분석 결과" → "음성 운율 분석 결과"로 섹션명 변경
+   - "감정/분위기 판단 규칙" 섹션 신규 추가
+     * 텍스트 기반 판단 가이드: 어투, 단어 선택별 감정 매핑
+     * 운율 기반 판단 가이드: 피치+에너지+말속도 조합별 해석
+   - JSON 출력 형식의 감정 관련 필드 설명 업데이트
+
+2. app/main.py
+   - emotion_analyzer import 제거
+   - 감정분석 호출 비활성화 (emotion_data = {} 고정)
+   - analysis_meta 구성 변경:
+     * 기존: "감정={tone}, 음성={voice}" (감정모델 결과 + 운율 요약)
+     * 변경: "평균피치=XXHz(level), 피치변동성=XX, 평균에너지=XX(level), 말속도=XX, 종합=XX"
+     * 운율 수치를 LLM에 직접 전달하여 맥락적 감정 판단 유도
+
+3. app/services/prosody_analyzer.py
+   - analyze_prosody_by_speaker() 반환값에 avg_energy 필드 추가
+   - 화자별 평균 에너지 수치를 LLM 전달용으로 산출
+
+기대 효과:
+- 감정분석 모델의 편향("항상 분노") 문제 근본 해결
+- LLM이 대화 맥락을 이해하고 운율 데이터를 참고하여 자연스러운 감정 판단
+- 감정분석 단계 스킵으로 처리 시간 단축 (약 10~30초 절약)
+- emotion_analyzer.py 코드는 유지 (향후 더 좋은 모델 등장 시 재활성화 가능)
+
+
+[실험 8] 세그먼트별 운율 인라인 전달 + vLLM 0.55 (2026-05-29)
+────────────────────────────────────────
+
+문제:
+- 실험 7에서 감정분석을 LLM 기반(방법 D)으로 전환했으나,
+  화자별 평균 운율만 전달하여 대화 중 감정 변화를 LLM이 감지하지 못함
+- 15분+ 음성에서 초반 차분 → 후반 흥분 같은 변화가 평균에 묻힘
+
+해결:
+1. vLLM gpu-memory-utilization 0.40 → 0.55 (KV 캐시 여유 확보)
+   - --quantization awq 플래그 제거 (모델 자동 감지, compressed-tensors 사용)
+   - --max-num-batched-tokens 4096 추가 (멀티모달 토큰 제한 해결)
+2. 세그먼트별 운율 인라인 전달
+   - prosody_analyzer.py: analyze_prosody_per_segment() 함수 추가
+     * 세그먼트마다 개별 운율(피치/에너지/말속도) 분석 결과를 리스트로 반환
+   - main.py: LLM 전달 트랜스크립트에 운율 인라인 태그 추가
+     * 형식: [00:30~00:45] [매니저] 대화내용  |운율: 피치=170Hz(normal), 에너지=normal, 말속도=normal|
+     * 화자별 종합 운율은 analysis_meta에 간략히 유지
+   - report_prompt.txt: 인라인 운율 형식 안내 추가
+     * "|운율: ...|" 태그가 각 발화의 음성 특성임을 명시
+     * 대화 중 운율 급변 시 감정 변화 가능성 판단 규칙 추가
+
+E2E 테스트 결과 (processing_id: 0045053b):
+- 처리 시간: STT 117s + 운율 14s + LLM 72s = 총 204초
+- 프롬프트 크기: 5,415자 (이전 4,417자 대비 약 1,000자 증가)
+- 감정 판단 결과 (크게 개선):
+  * 시니어: "평온하고 담담한 상태" (이전: "분노")
+  * 매니저: "안정적인 톤, 조언 시 말속도 빨라지며 적극적" (이전: "슬픔")
+  * 기분상태: "안정적인 톤과 보통의 속도, 평온하고 담담" (이전: "격앙됨")
+- LLM이 자체적으로 위험요소 감지:
+  * "아침 약 미복용 확인"
+  * "빈속에 커피 및 관절약 복용 가능성"
+- 잔존 환각: "및 해 주신 모든", "및 자막 제공" (YouTube 블랙리스트 확장 필요)
+
+
+[실험 9] 운율 1차 개선 - baseline + 급변 (2026-05-29)
+────────────────────────────────────────
+
+목표: "다 보통" 문제 완화, 감정 변화 시점 포착 (①+②)
+
+변경 (prosody_analyzer.py):
+- analyze_prosody_full() 신규: 세그먼트 1회 분석 → baseline → enrich
+- 화자별 baseline: pitch/energy/std 중앙값
+- 세그먼트 enrich:
+  * pitch_vs_baseline_pct, energy_vs_baseline_pct (평소 대비 %)
+  * relative_pitch: much_lower ~ much_higher
+  * pitch_var_level: low/normal/high (화자 std 대비)
+  * sudden_change: 직전 3발화 대비 피치 ±25% 또는 에너지 ±40%
+- format_prosody_inline_tag(): LLM 인라인 태그 포맷
+- analyze_prosody_by_speaker/per_segment → full 래퍼 (중복 분석 제거)
+
+변경 (main.py):
+- analyze_prosody_full 1회 호출 (prosody 시간 단축 기대)
+- analysis_meta에 baseline Hz 표시
+- 인라인 |운율:| 평소대비%, 변동std, 급변 포함
+
+변경 (guard_filter.py):
+- pitch_level 제거 → dominant_relative_pitch + sudden_change_count 활용
+
+변경 (report_prompt.txt):
+- baseline 대비 %, 급변= 해석 규칙 추가
+
+E2E 테스트 결과 (processing_id: 85b6bed1, skip_llm=true):
+- 테스트 음성: uploads/2502340c... (~10분, 43세그먼트)
+- 처리 시간:
+  * STT+화자분리: 118.77초 (이전 0045053b: 117.45초, 유사)
+  * 운율분석: 7.4초 (이전 14.43초 → **약 49% 단축**, 중복 분석 제거 효과)
+  * 총: 126.17초 (LLM 스킵)
+- prosody_data 신규 필드 동작 확인:
+  * SPEAKER_00: baseline 184Hz, 급변 4회
+  * SPEAKER_01: baseline 174Hz, 급변 5회
+  * UNKNOWN: baseline 233Hz, 급변 3회
+  * voice_description 예: "평소피치 184Hz, 전체 평소, 변동 보통, ..., 급변 4회"
+    (이전: "보통 높이, 안정적인 톤, 보통 속도" — baseline·급변 정보 없음)
+- 인라인 |운율:| 형식 (LLM 전달용):
+  * "피치=220Hz(높음,+12%), 변동=큼(std=45), 에너지=normal(+5%), 말속도=fast, 급변=피치↑"
+- 가드레일 prosody 연동:
+  * sudden_change_count ≥ 3 → "운율 급변 다발 (N회)" 플래그 (3명 화자 모두 감지)
+  * pitch_level(절대값) 대신 dominant_relative_pitch 기준으로 변경
+- 한계 (1차 개선 후에도):
+  * dominant_relative_pitch는 여전히 "normal"이 많음 (세그먼트 다수가 평소 근처)
+  * 급변 횟수(sudden_change_count)로 변화는 포착됨 → 2차(긴 세그먼트 분할) 필요
+- LLM 포함 전체 E2E: 테스트 시작 후 중단 (test_full_result.json 미생성)
+  → Swagger UI에서 skip_llm=false로 재확인 가능
+
+
+[분석 메모] 40분 음성 사용자 테스트 (processing_id: 95433d55, 실험 9 이전)
+────────────────────────────────────────
+- 대화 2399초(~40분), STT 386s + 운율 50s + LLM 84s = 총 520s
+- 방법 D 감정 판단: LLM 보고서 톤/기분은 자연스러움 (평온, 공감적 등)
+- STT가 병목: 93초 메가세그먼트, 12분 공백, "갔다 왔다" 환각
+- prosody_data 화자별 "보통"만 표시 → 실험 9(baseline+급변) 동기
+- 가드레일 오탐: "돌아가셨", "죽었어"(과장), "아파"(통풍 설명) → 키워드-only 한계
+- 개선 우선순위 확정: STT → 위험단어 → 운율(①②) → 긴음성 대비
+
+
+[현재 상태]
+────────────────────────────────────────
+✅ STT (Whisper large-v3-turbo, transformers) - GB10 동작 확인
+✅ 화자분리 (pyannote) - GB10 동작 확인
+✅ 감정분석 → LLM 기반 (텍스트+운율, 방법 D)
+✅ 운율분석 (torchcrepe + librosa)
+   - baseline 대비 상대값 + pitch 변동 + 급변 감지 (1차) — E2E 검증 완료 (85b6bed1)
+   - 세그먼트 1회 pass, prosody ~7초 (10분 음성 기준)
+✅ 가드레일 (역할 매핑 + 위험 키워드 + 운율 급변) - 동작 확인
+✅ LLM 서버 (Gemma-4-31B AWQ 4bit, vLLM) - port 2000, gpu-mem 0.55
+✅ FastAPI Swagger UI - http://localhost:9002/docs
+✅ 환각 필터 (5단계)
+✅ 인접 짧은 세그먼트 병합
+⬜ 운율 1차 + LLM 포함 E2E (skip_llm=false, 새 인라인 태그)
+⬜ STT 품질 (환각·공백·장세그먼트) — 최우선 과제
+⬜ 위험 키워드 맥락 필터 (오탐: 돌아가/죽었/아파)
+⬜ 운율 2차: 긴 세그먼트 분할, STT 기반 말속도
+⬜ Docker/Celery 통합
+⬜ 프롬프트 규칙 700~800줄 추가 (추후)
