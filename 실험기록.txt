@@ -588,3 +588,129 @@ E2E 테스트 (processing_id: 03c8469a, llm_mode=emotion):
   * danger_detection: 운율 급변 다발 플래그만 (키워드 오탐 없음)
 
 결과 파일: emotion_test_result.json (로컬, gitignore)
+
+
+[개선 1단계] UNKNOWN 화자 → 미확인 (화자 역할 매핑)
+────────────────────────────────────────
+날짜: 2026-05-26
+문제:
+  - pyannote 미할당(UNKNOWN) 세그먼트가 키워드 점수 2위로 잡혀 "시니어" 또는 "동거인_2"로 오라벨링
+  - 짧은 음성 실험(59022c2f): UNKNOWN→시니어 → LLM·enriched 트랜스크립트 왜곡
+
+변경 (app/services/guard_filter.py):
+  - identify_speaker_roles: UNKNOWN은 점수 집계·순위에서 제외
+  - speaker_roles["UNKNOWN"] = "미확인" 고정
+  - role_for_speaker() 헬퍼: enriched / prosody_transcript 공통 fallback
+
+변경 (app/services/transcript_builder.py):
+  - build_prosody_transcript: role_for_speaker 사용
+
+변경 (app/prompts/emotion_prompt.txt):
+  - [미확인] 발화는 화자별_분석 제외, 특이사항만 언급
+
+검증:
+  - 유닛 테스트: UNKNOWN 포함 5세그먼트 → {'SPEAKER_00':'매니저','SPEAKER_01':'시니어','UNKNOWN':'미확인'} ✅
+  - API 9002 재시작 (--reload) ✅
+  - E2E: 동일 짧은 음성으로 POST /analyze (llm_mode=emotion) 재실행 후 확인
+    * speaker_roles.UNKNOWN == "미확인" (이전: "시니어")
+    * transcript_enriched 에 [미확인] 표기
+
+다음 단계 (예정 2단계): STT 알려진 환각 문구 필터 ("및 해 주신", "자막 제공" 등)
+
+
+[개선 2단계] STT 알려진 환각 문구 필터
+────────────────────────────────────────
+날짜: 2026-05-26
+문제:
+  - Whisper 환각: "및 해 주신 모든", "자막 제공 ... 분들께"
+  - 긴 세그먼트 내 "갔다 왔다" 수십 회 반복
+
+변경:
+  - app/services/stt_cleanup.py (신규)
+    * clean_segment_text(): 환각 문구 제거, 반복 축약
+    * filter_hallucination_segments(): 빈/쓰레기 세그먼트 삭제
+  - app/services/whisperx_loader.py: STT 후 dedup 다음에 5b 단계 적용
+
+제거/축약 패턴:
+  - 자막 제공, 및 해 주신 모든, 시청해 주셔서 감사합니다, 구독과 좋아요 등
+  - (갔다 왔다){3회+} → "갔다 왔다 " 한 번
+
+검증:
+  - 유닛 테스트: 환각-only 세그먼트 제거, 문장 내 환각 제거, 갔다왔다 반복 축약 ✅
+  - API --reload 로 stt_cleanup 자동 반영
+  - E2E: 짧은 음성 재실행 → transcript에 "자막 제공"/"및 해 주신" 없음 확인
+
+다음 단계 (예정 3단계): danger_detection 키워드 문맥 필터 (돌아가/죽었 오탐)
+
+
+[개선 3단계] danger_detection 키워드 문맥 필터
+────────────────────────────────────────
+날짜: 2026-05-26
+문제 (긴 음성 eef7071a):
+  - "돌아가셨지만" → 사망 키워드 오탐 (지인/사돈 회상)
+  - "안 했으면 죽었어" → 사망 키워드 오탐 (과장 표현)
+  - 통풍 설명 중 "아파요" → 통증 키워드 다발 (상담 맥락)
+
+변경 (app/services/guard_filter.py):
+  - is_danger_false_positive(): 문맥 제외 판단
+  - detect_dangers_from_audio(): 제외 시 flags/details에 미포함
+
+제외 규칙:
+  - 사망/돌아가: 돌아가셨·돌아가신·돌아가셨지만 등 과거 회상
+  - 사망/죽었: 안 했으면 죽었, 거의 죽었 등 가정·과장
+  - 통증: 통풍·병원·통증 설명 문장 (교육/상담 맥락)
+
+검증:
+  - 유닛 테스트: 돌아가셨지만/안했으면 죽었/통풍설명 → flags 비어 있음 ✅
+  - E2E: 긴 음성 재실행 → danger flags에서 "사망 키워드"·"통증 키워드" 감소 확인
+
+다음 단계 (예정 4단계): 운율 급변 다발 임계값 조정 (danger 플래그 과다)
+
+
+[개선 4단계] 운율 급변 다발 danger 임계값
+────────────────────────────────────────
+날짜: 2026-05-26
+문제:
+  - sudden_change_count >= 3 이면 모든 화자에 "운율 급변 다발" (일상 대화에서도 3~9회)
+  - 짧은/긴 음성 모두 danger flags가 운율만으로 가득 참
+
+변경 (app/services/guard_filter.py):
+  - PROSODY_DANGER_SUDDEN_MIN=7 (환경변수, 기본 7) — danger 플래그만 적용
+  - UNKNOWN 화자는 운율 danger 플래그 제외
+  - 세그먼트 |운율: 급변=| 표시는 기존 민감도 유지 (LLM 감정 분석용)
+
+변경 (.env.example):
+  - PROSODY_DANGER_SUDDEN_MIN=7
+
+검증:
+  - 유닛: count 4→플래그 없음, count 9→플래그 있음 ✅
+  - E2E: 짧은 음성(4~5회) → 운율 급변 다발 플래그 없음 기대
+  - E2E: 긴 음성(9회) → 해당 화자만 플래그 유지 가능
+
+다음 단계 (예정 5단계): STT/VAD·긴 공백 세그먼트 (05:17~17:21 등)
+
+
+[개선 5단계] STT 긴 공백·초장 세그먼트 정리
+────────────────────────────────────────
+날짜: 2026-05-26
+문제:
+  - 90초+ 단일 세그먼트 (00:23~01:56 등) → 운율·LLM 입력 왜곡
+  - 03:53~05:40 등 긴 구간에 짧은 환각만 ("안녕하세요")
+  - 05:17~17:21 등 다분 무음 (타임라인 공백)
+
+변경:
+  - app/services/stt_cleanup.py
+    * filter_sparse_long_segments(): 45초+ & 1.2자/초 미만 → 제거
+    * split_long_segments(): 90초 초과 → 문장/균등 분할
+    * log_large_gaps(): 90초+ 무음 구간 로그
+    * repair_segments_gaps_and_length(): 5c 일괄 적용
+  - whisperx_loader.py
+    * 병합: 갭 > STT_MAX_MERGE_GAP_SEC(30) 이면 인접 병합 금지
+    * 5c 단계를 환각 필터(5b) 다음에 실행
+
+환경변수 (.env.example):
+  STT_MAX_MERGE_GAP_SEC, STT_MAX_SEGMENT_SEC, STT_SPARSE_* , STT_GAP_LOG_SEC
+
+검증:
+  - 유닛 테스트: 106초+짧은텍스트 제거, 120초 장문 분할 ✅
+  - E2E: 짧은/긴 음성 재실행 → 90초 넘는 단일 세그먼트 감소, 공백환각 세그먼트 제거 확인

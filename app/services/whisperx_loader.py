@@ -244,7 +244,12 @@ def transcribe_with_diarization(
         prev_duration = prev.get("end", 0) - prev.get("start", 0)
         cur_duration = seg.get("end", 0) - seg.get("start", 0)
 
-        if same_speaker and (gap < 1.5 or prev_duration < 2.0 or cur_duration < 2.0):
+        from app.services.stt_cleanup import MAX_MERGE_GAP_SEC
+
+        merge_ok = gap < MAX_MERGE_GAP_SEC and (
+            gap < 1.5 or prev_duration < 2.0 or cur_duration < 2.0
+        )
+        if same_speaker and merge_ok:
             prev["end"] = seg.get("end", prev["end"])
             prev_text = prev.get("text", "").strip()
             cur_text = seg.get("text", "").strip()
@@ -277,6 +282,29 @@ def transcribe_with_diarization(
         removed = len(final_segments) - len(deduped_segments)
         logger.info(f"[필터] 세그먼트 간 반복 {removed}개 제거 ({len(final_segments)} → {len(deduped_segments)})")
     final_segments = deduped_segments
+
+    # 5b. 알려진 STT 환각 문구 제거
+    from app.services.stt_cleanup import (
+        filter_hallucination_segments,
+        repair_segments_gaps_and_length,
+    )
+
+    final_segments, hallucination_stats = filter_hallucination_segments(final_segments)
+    if hallucination_stats["text_cleaned"] or hallucination_stats["segments_dropped"]:
+        logger.info(
+            f"[필터] STT 환각 정리: 텍스트 수정 {hallucination_stats['text_cleaned']}건, "
+            f"세그먼트 제거 {hallucination_stats['segments_dropped']}건 "
+            f"→ {len(final_segments)}개 유지"
+        )
+
+    # 5c. 긴 공백·초장 세그먼트 정리
+    final_segments, gap_stats = repair_segments_gaps_and_length(final_segments)
+    if any(gap_stats.values()):
+        logger.info(
+            f"[필터] STT 구간 정리: 공백로그 {gap_stats['gaps_logged']}건, "
+            f"저밀도제거 {gap_stats['sparse_dropped']}건, "
+            f"장세그분할 {gap_stats['long_split']}건 → {len(final_segments)}개"
+        )
 
     # 6. 출력 포맷팅
     labeled_lines = []

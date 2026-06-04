@@ -1,6 +1,8 @@
 """LLM 입력용 트랜스크립트·메타데이터 조립"""
 from typing import Dict, List, Any, Optional, Callable
 
+from app.services.guard_filter import role_for_speaker
+
 
 def build_analysis_meta(
     speaker_roles: Dict[str, str],
@@ -30,7 +32,7 @@ def build_prosody_transcript(
         end = seg.get("end", 0)
         speaker = seg.get("speaker", "UNKNOWN")
         text = seg.get("text", "").strip()
-        role = speaker_roles.get(speaker, speaker)
+        role = role_for_speaker(speaker, speaker_roles)
 
         start_str = f"{int(start // 60):02d}:{start % 60:05.1f}"
         end_str = f"{int(end // 60):02d}:{end % 60:05.1f}"
