@@ -260,6 +260,10 @@ def analyze_prosody_full(
         start = seg.get("start", 0)
         end = seg.get("end", 0)
 
+        if seg.get("is_silence_gap") or speaker == "SILENCE_GAP":
+            raw_results.append({"seg_idx": i, "speaker": speaker, "prosody": None})
+            continue
+
         if end - start < MIN_SEGMENT_SEC:
             raw_results.append({"seg_idx": i, "speaker": speaker, "prosody": None})
             continue

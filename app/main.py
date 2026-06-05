@@ -18,17 +18,8 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 
 from app.services.whisperx_loader import transcribe_with_diarization
-from app.services.prosody_analyzer import analyze_prosody_full, format_prosody_inline_tag
-from app.services.guard_filter import (
-    identify_speaker_roles,
-    detect_dangers_from_audio,
-    build_enriched_transcript,
-)
-from app.services.transcript_builder import (
-    build_analysis_meta,
-    build_prosody_transcript,
-    serialize_segment_prosody,
-)
+from app.services.analysis_pipeline import run_post_stt_pipeline
+from app.services.transcript_builder import serialize_segment_prosody
 from app.services.llm_summarizer import (
     analyze_emotion_speakers,
     summarize_transcript,
@@ -97,22 +88,21 @@ async def analyze_audio(
             f"[{processing_id}] STT+화자분리 완료: {len(segments)}개 ({timing['stt_diarization']}초)"
         )
 
-        emotion_data = {}
-
         t0 = time.perf_counter()
-        segment_prosody, prosody_data = analyze_prosody_full(audio_path, segments)
+        pipeline = run_post_stt_pipeline(audio_path, segments)
         timing["prosody"] = round(time.perf_counter() - t0, 2)
-        logger.info(f"[{processing_id}] 운율분석 완료 ({timing['prosody']}초)")
+        logger.info(f"[{processing_id}] 운율·가드레일 완료 ({timing['prosody']}초)")
 
-        speaker_roles = identify_speaker_roles(segments, emotion_data, prosody_data)
-        danger_detection = detect_dangers_from_audio(segments, emotion_data, prosody_data)
-        enriched_transcript = build_enriched_transcript(segments, speaker_roles)
-
-        duration_sec = int(segments[-1].get("end", 0)) if segments else 0
-        analysis_meta = build_analysis_meta(speaker_roles, prosody_data, danger_detection)
-        prosody_transcript = build_prosody_transcript(
-            segments, segment_prosody, speaker_roles, format_prosody_inline_tag
-        )
+        emotion_data = pipeline["emotion_data"]
+        segment_prosody = pipeline["segment_prosody"]
+        prosody_data = pipeline["prosody_data"]
+        speaker_roles = pipeline["speaker_roles"]
+        speaker_profiles = pipeline["speaker_profiles"]
+        danger_detection = pipeline["danger_detection"]
+        enriched_transcript = pipeline["transcript_enriched"]
+        duration_sec = pipeline["duration_sec"]
+        analysis_meta = pipeline["analysis_meta"]
+        prosody_transcript = pipeline["prosody_transcript"]
 
         emotion_analysis = None
         summary = None
@@ -171,6 +161,7 @@ async def analyze_audio(
             "transcript_enriched": enriched_transcript,
             "prosody_transcript": prosody_transcript,
             "speaker_roles": speaker_roles,
+            "speaker_profiles": speaker_profiles,
             "emotion_data": emotion_data,
             "prosody_data": prosody_data,
             "segment_prosody": serialize_segment_prosody(segment_prosody),

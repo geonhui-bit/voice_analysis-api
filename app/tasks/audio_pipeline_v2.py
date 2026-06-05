@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 from app.services.audio_handler_v2 import process_audio_file_v2
 from app.services.audio_handler import cleanup_audio_files
-from app.services.llm_summarizer_qwen8b_chunked_comma import summarize_transcript
+from app.services.llm_summarizer import summarize_transcript, check_danger_detected
 from app.utils.time_utils import calculate_age
 from app.utils.logger import get_logger
 from app.utils.gcs import upload_to_gcs
@@ -46,9 +46,11 @@ def save_result_to_file(processing_id: str, result: Dict[str, Any], **kwargs) ->
                     "transcript_labeled": result.get("transcript_labeled", ""),
                     "summary": result.get("summary", {}),
                     "speaker_roles": result.get("speaker_roles", {}),
+                    "speaker_profiles": result.get("speaker_profiles", {}),
                     "emotion_data": result.get("emotion_data", {}),
                     "prosody_data": result.get("prosody_data", {}),
                     "danger_detection": result.get("danger_detection", {}),
+                    "prosody_transcript": result.get("prosody_transcript", ""),
                     "processing_time": result.get("processing_time", 0),
                     "audio_duration": result.get("audio_duration", 0),
                     "timing": result.get("timing", {}),
@@ -109,18 +111,18 @@ def process_audio_task_v2(
         # 3. LLM 요약 (enriched transcript + 감정/프로소디 메타데이터 전달)
         age = calculate_age(user_info.get("birth_date", ""))
 
-        audio_analysis_meta = _build_analysis_meta(
-            audio_result["speaker_roles"],
-            audio_result["emotion_data"],
-            audio_result["prosody_data"],
-            audio_result["danger_detection"]
+        audio_analysis_meta = audio_result.get("analysis_meta", "")
+
+        danger_detection = audio_result.get("danger_detection", {})
+        danger_for_llm = (
+            danger_detection
+            if check_danger_detected(danger_detection)
+            else (danger_info if check_danger_detected(danger_info) else None)
         )
 
-        from app.services.llm_summarizer_qwen8b_chunked_comma import check_danger_detected
-        danger_detected = check_danger_detected(danger_info)
-
         summary = summarize_transcript(
-            transcript=audio_result["transcript_enriched"],
+            transcript=audio_result.get("prosody_transcript")
+            or audio_result["transcript_enriched"],
             start_time=start_time_str,
             end_time=end_time_str,
             duration_sec=round(audio_result["duration_seconds"]),
@@ -130,7 +132,8 @@ def process_audio_task_v2(
             age=age,
             gender=user_info.get("gender", ""),
             address=user_info.get("address", ""),
-            danger_info=danger_info if danger_detected else None
+            analysis_meta=audio_analysis_meta,
+            danger_info=danger_for_llm,
         )
 
         # 감정/톤 정보 보강 (LLM 결과에 음성분석 결과 병합)
@@ -150,8 +153,10 @@ def process_audio_task_v2(
             "transcript": audio_result["transcript"],
             "transcript_labeled": audio_result["transcript_labeled"],
             "speaker_roles": audio_result["speaker_roles"],
+            "speaker_profiles": audio_result.get("speaker_profiles", {}),
             "emotion_data": audio_result["emotion_data"],
             "prosody_data": audio_result["prosody_data"],
+            "prosody_transcript": audio_result.get("prosody_transcript", ""),
             "danger_detection": audio_result["danger_detection"],
             "timing": audio_result["timing"],
             "audio_gcs_path": audio_result["audio_gcs_url"],
@@ -183,28 +188,6 @@ def process_audio_task_v2(
         raise RuntimeError(error_msg)
 
 
-def _build_analysis_meta(
-    speaker_roles: Dict,
-    emotion_data: Dict,
-    prosody_data: Dict,
-    danger_detection: Dict
-) -> str:
-    """LLM 프롬프트에 추가할 음성분석 메타데이터 텍스트"""
-    lines = ["[음성 분석 결과]"]
-
-    for speaker, role in speaker_roles.items():
-        emo = emotion_data.get(speaker, {})
-        pros = prosody_data.get(speaker, {})
-        tone = emo.get("tone_description", "분석 불가")
-        voice = pros.get("voice_description", "분석 불가")
-        lines.append(f"- {role}({speaker}): 감정={tone}, 음성={voice}")
-
-    if danger_detection.get("detected"):
-        lines.append(f"- ⚠ 위험 플래그: {', '.join(danger_detection['flags'])}")
-
-    return "\n".join(lines)
-
-
 def _enrich_summary_with_audio_analysis(
     summary: Dict,
     audio_result: Dict,
@@ -223,22 +206,24 @@ def _enrich_summary_with_audio_analysis(
         elif role == "시니어":
             senior_speaker = speaker
 
-    # 매니저 톤 보강
-    if manager_speaker:
-        emo = emotion_data.get(manager_speaker, {})
-        pros = prosody_data.get(manager_speaker, {})
+    def _tone_line(speaker_id: str) -> str:
+        emo = emotion_data.get(speaker_id, {})
+        pros = prosody_data.get(speaker_id, {})
+        parts = []
         if emo.get("tone_description"):
-            summary["매니저의 대화 분위기, 톤"] = emo["tone_description"]
+            parts.append(emo["tone_description"])
         if pros.get("voice_description"):
-            summary["매니저의 대화 분위기, 톤"] += f" ({pros['voice_description']})"
+            parts.append(pros["voice_description"])
+        return " — ".join(parts) if parts else ""
 
-    # 시니어 톤 보강
+    if manager_speaker:
+        line = _tone_line(manager_speaker)
+        if line:
+            summary["매니저의 대화 분위기, 톤"] = line
+
     if senior_speaker:
-        emo = emotion_data.get(senior_speaker, {})
-        pros = prosody_data.get(senior_speaker, {})
-        if emo.get("tone_description"):
-            summary["시니어의 대화 분위기, 톤"] = emo["tone_description"]
-        if pros.get("voice_description"):
-            summary["시니어의 대화 분위기, 톤"] += f" ({pros['voice_description']})"
+        line = _tone_line(senior_speaker)
+        if line:
+            summary["시니어의 대화 분위기, 톤"] = line
 
     return summary

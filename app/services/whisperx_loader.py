@@ -302,13 +302,20 @@ def transcribe_with_diarization(
     if any(gap_stats.values()):
         logger.info(
             f"[필터] STT 구간 정리: 공백로그 {gap_stats['gaps_logged']}건, "
+            f"장세그분할 {gap_stats['long_split']}건, "
+            f"루프정리 {gap_stats.get('loop_cleaned', 0)}건, "
             f"저밀도제거 {gap_stats['sparse_dropped']}건, "
-            f"장세그분할 {gap_stats['long_split']}건 → {len(final_segments)}개"
+            f"무음내환각 {gap_stats.get('gap_hallucination_dropped', 0)}건, "
+            f"무음마커 {gap_stats.get('silence_markers', 0)}건, "
+            f"화자혼합분리 {gap_stats.get('post_silence_resplit', 0)}건 → {len(final_segments)}개"
         )
 
     # 6. 출력 포맷팅
     labeled_lines = []
     plain_lines = []
+
+    from app.services.stt_cleanup import SPEAKER_SILENCE_GAP
+    from app.services.guard_filter import ROLE_SILENCE_GAP
 
     for seg in final_segments:
         start = seg.get("start", 0)
@@ -318,6 +325,11 @@ def transcribe_with_diarization(
 
         start_str = f"{int(start//60):02d}:{start%60:06.3f}"
         end_str = f"{int(end//60):02d}:{end%60:06.3f}"
+
+        if seg.get("is_silence_gap") or speaker == SPEAKER_SILENCE_GAP:
+            labeled_lines.append(f"[{start_str} --> {end_str}] [{ROLE_SILENCE_GAP}] {text}")
+            plain_lines.append(f"[{start_str} --> {end_str}] {text}")
+            continue
 
         labeled_lines.append(f"[{start_str} --> {end_str}] [{speaker}] {text}")
         plain_lines.append(f"[{start_str} --> {end_str}] {text}")
